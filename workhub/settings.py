@@ -80,7 +80,7 @@ TIME_ZONE = 'UTC'
 USE_I18N = True
 USE_TZ = True
 
-# Static files (CSS, JavaScript, Images)
+# Static files
 STATIC_URL = 'static/'
 STATICFILES_DIRS = [BASE_DIR / 'static'] if (BASE_DIR / 'static').exists() else []
 
@@ -91,6 +91,40 @@ LOGIN_URL = 'login'
 LOGIN_REDIRECT_URL = 'dashboard'
 LOGOUT_REDIRECT_URL = 'login'
 
-# Email backend configuration (Development: Console, Production: SMTP)
-EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
-DEFAULT_FROM_EMAIL = 'WorkHub Notifications <noreply@workhub.internal>'
+# ==========================================
+# EMAIL DELIVERY CONFIGURATION (Real SMTP / Inbox)
+# ==========================================
+# Read .env file from project root
+env_file = BASE_DIR / '.env'
+if env_file.exists():
+    with open(env_file, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith('#') and '=' in line:
+                key, val = line.split('=', 1)
+                k = key.strip()
+                v = val.strip().strip("'\"")
+                if k == 'EMAIL_HOST_PASSWORD':
+                    v = v.replace(' ', '')  # remove Google 4-letter grouping spaces
+                os.environ[k] = v
+
+EMAIL_HOST_USER = os.environ.get('EMAIL_HOST_USER', '').strip()
+EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD', '').strip().replace(' ', '')
+
+if EMAIL_HOST_USER and EMAIL_HOST_PASSWORD:
+    EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
+    EMAIL_HOST = 'smtp.gmail.com'
+    # Use Port 465 with SSL (most reliable on Windows and avoids STARTTLS connection drops)
+    EMAIL_PORT = int(os.environ.get('EMAIL_PORT', 465))
+    if EMAIL_PORT == 465:
+        EMAIL_USE_SSL = True
+        EMAIL_USE_TLS = False
+    else:
+        EMAIL_USE_SSL = False
+        EMAIL_USE_TLS = True
+    EMAIL_TIMEOUT = 10
+    DEFAULT_FROM_EMAIL = f'WorkHub Notifications <{EMAIL_HOST_USER}>'
+else:
+    # Fallback to console if no SMTP credentials are configured yet
+    EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
+    DEFAULT_FROM_EMAIL = 'WorkHub Notifications <noreply@workhub.internal>'

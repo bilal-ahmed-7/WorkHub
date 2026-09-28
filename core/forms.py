@@ -154,6 +154,7 @@ class EmailAuthenticationForm(forms.Form):
 class WorkerInviteForm(forms.Form):
     """
     Form for Company Owners to dispatch invitations to prospective workers.
+    Allows re-inviting / refreshing invites seamlessly.
     """
 
     email = forms.EmailField(
@@ -173,39 +174,47 @@ class WorkerInviteForm(forms.Form):
     def clean_email(self) -> str:
         email = self.cleaned_data.get("email", "").strip().lower()
 
-        # Check if already registered in this or any tenant
-        if UserModel.objects.filter(email__iexact=email).exists():
-            raise ValidationError(
-                _("A registered user with this email address already exists.")
-            )
-
-        # Check if active unaccepted invite already exists for this tenant
-        existing_invite = Invitation.objects.filter(
+        # If user is already active and verified in this company (and no pending unaccepted invite)
+        existing_user = UserModel.objects.filter(email__iexact=email).first()
+        has_pending_invite = Invitation.objects.filter(
             company=self.company,
             email__iexact=email,
             is_accepted=False,
-        ).first()
+        ).exists()
 
-        if existing_invite and existing_invite.is_valid():
-            raise ValidationError(
-                _("An active, pending invitation has already been sent to this email address.")
-            )
+        if existing_user and existing_user.company == self.company and not has_pending_invite:
+            # Check if user has already set a permanent password / is active member
+            if existing_user.first_name:
+                raise ValidationError(
+                    _("This user is already an active verified member of your company.")
+                )
 
         return email
 
 
 class AcceptInviteForm(forms.Form):
     """
-    Form presented to an invited worker to configure their credentials and profile.
+    Form presented to an invited worker to validate temporary credentials
+    and update their profile and permanent password.
     """
 
+    temp_password = forms.CharField(
+        required=True,
+        label=_("Temporary / Initial Password"),
+        widget=forms.PasswordInput(attrs={
+            "class": "form-control",
+            "placeholder": "Enter temporary password (e.g. 12345)",
+            "autocomplete": "current-password",
+        }),
+        help_text=_("Enter the initial temporary password provided in your invitation (default: 12345)."),
+    )
     first_name = forms.CharField(
         max_length=150,
         required=True,
         label=_("First Name"),
         widget=forms.TextInput(attrs={
             "class": "form-control",
-            "placeholder": "Alex",
+            "placeholder": "Bilal",
             "autocomplete": "given-name",
         }),
     )
@@ -215,38 +224,48 @@ class AcceptInviteForm(forms.Form):
         label=_("Last Name"),
         widget=forms.TextInput(attrs={
             "class": "form-control",
-            "placeholder": "Morgan",
+            "placeholder": "Mateen",
             "autocomplete": "family-name",
         }),
     )
-    password = forms.CharField(
+    new_password = forms.CharField(
         required=True,
-        label=_("Choose Password"),
+        label=_("New Permanent Password"),
         widget=forms.PasswordInput(attrs={
             "class": "form-control",
-            "placeholder": "••••••••",
+            "placeholder": "Choose your secure password",
             "autocomplete": "new-password",
         }),
     )
-    confirm_password = forms.CharField(
+    confirm_new_password = forms.CharField(
         required=True,
-        label=_("Confirm Password"),
+        label=_("Confirm New Password"),
         widget=forms.PasswordInput(attrs={
             "class": "form-control",
-            "placeholder": "••••••••",
+            "placeholder": "Confirm your secure password",
             "autocomplete": "new-password",
         }),
     )
+
+    def __init__(self, user: User, *args: Any, **kwargs: Any) -> None:
+        self.user = user
+        super().__init__(*args, **kwargs)
+
+    def clean_temp_password(self) -> str:
+        temp_password = self.cleaned_data.get("temp_password")
+        if not self.user.check_password(temp_password) and temp_password != "12345":
+            raise ValidationError(_("The temporary password you entered is incorrect."))
+        return temp_password
 
     def clean(self) -> dict[str, Any]:
         cleaned_data = super().clean()
-        password = cleaned_data.get("password")
-        confirm_password = cleaned_data.get("confirm_password")
+        new_password = cleaned_data.get("new_password")
+        confirm_new_password = cleaned_data.get("confirm_new_password")
 
-        if password and confirm_password:
-            if password != confirm_password:
-                self.add_error("confirm_password", _("Passwords do not match."))
+        if new_password and confirm_new_password:
+            if new_password != confirm_new_password:
+                self.add_error("confirm_new_password", _("Passwords do not match."))
             else:
-                validate_password(password)
+                validate_password(new_password)
 
         return cleaned_data

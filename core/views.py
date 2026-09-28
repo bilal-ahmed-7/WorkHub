@@ -1,4 +1,4 @@
-import secrets
+import uuid
 from datetime import timedelta
 from typing import Any
 
@@ -6,12 +6,14 @@ from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth import authenticate, login, logout
 from django.contrib.auth.mixins import LoginRequiredMixin
-from django.core.mail import send_mail
+from django.core.mail import EmailMultiAlternatives
 from django.db import transaction
 from django.http import HttpRequest, HttpResponse, HttpResponseRedirect
 from django.shortcuts import get_object_or_404, redirect, render
+from django.template.loader import render_to_string
 from django.urls import reverse, reverse_lazy
 from django.utils import timezone
+from django.utils.html import strip_tags
 from django.views import View
 from django.views.generic import DeleteView, FormView, ListView, TemplateView
 
@@ -114,7 +116,8 @@ class LogoutUserView(View):
 class AcceptInviteView(View):
     """
     Worker invitation acceptance endpoint.
-    Validates token integrity and creates the Worker User linked to the inviter's company.
+    Validates token integrity, verifies temporary password, and stores
+    the permanent updated password in the database.
     """
 
     template_name = "accounts/accept_invite.html"
@@ -124,6 +127,17 @@ class AcceptInviteView(View):
             return Invitation.objects.select_related("company").get(token=token)
         except Invitation.DoesNotExist:
             return None
+
+    def get_or_create_worker_user(self, invitation: Invitation) -> User:
+        user = User.objects.filter(email__iexact=invitation.email).first()
+        if not user:
+            user = User.objects.create_user(
+                email=invitation.email,
+                password="12345",
+                role=User.Roles.WORKER,
+                company=invitation.company,
+            )
+        return user
 
     def get(self, request: HttpRequest, token: str) -> HttpResponse:
         invitation = self.get_invitation(token)
@@ -135,13 +149,15 @@ class AcceptInviteView(View):
                 status=400,
             )
 
-        form = AcceptInviteForm()
+        user = self.get_or_create_worker_user(invitation)
+        form = AcceptInviteForm(user=user)
         return render(
             request,
             self.template_name,
             {
                 "form": form,
                 "invitation": invitation,
+                "worker_user": user,
                 "invalid_or_expired": False,
             },
         )
@@ -156,22 +172,22 @@ class AcceptInviteView(View):
                 status=400,
             )
 
-        form = AcceptInviteForm(request.POST)
+        user = self.get_or_create_worker_user(invitation)
+        form = AcceptInviteForm(user, request.POST)
+
         if form.is_valid():
             first_name = form.cleaned_data["first_name"]
             last_name = form.cleaned_data["last_name"]
-            password = form.cleaned_data["password"]
+            new_password = form.cleaned_data["new_password"]
 
             with transaction.atomic():
-                # Create Worker user linked to tenant
-                user = User.objects.create_user(
-                    email=invitation.email,
-                    password=password,
-                    first_name=first_name,
-                    last_name=last_name,
-                    role=User.Roles.WORKER,
-                    company=invitation.company,
-                )
+                # Update user profile and set permanent hashed password in DB
+                user.first_name = first_name
+                user.last_name = last_name
+                user.role = User.Roles.WORKER
+                user.company = invitation.company
+                user.set_password(new_password)
+                user.save()
 
                 # Mark invitation as accepted
                 invitation.is_accepted = True
@@ -181,7 +197,7 @@ class AcceptInviteView(View):
             login(request, user)
             messages.success(
                 request,
-                f"Welcome aboard, {user.first_name}! You are now part of {invitation.company.name}.",
+                f"Your permanent password has been updated and saved! Welcome to {invitation.company.name}.",
             )
             return redirect("dashboard")
 
@@ -191,6 +207,7 @@ class AcceptInviteView(View):
             {
                 "form": form,
                 "invitation": invitation,
+                "worker_user": user,
                 "invalid_or_expired": False,
             },
         )
@@ -276,7 +293,9 @@ class WorkerListView(CompanyAdminMixin, ListView):
 
 class WorkerInviteView(CompanyAdminMixin, FormView):
     """
-    Allows Company Owners to invite new workers via tokenized email dispatch.
+    Allows Company Owners to invite new workers via rich HTML and plain-text email dispatch.
+    Pre-allots the worker user with default temporary credentials (12345) and generates
+    a 32-character hexadecimal token.
     """
 
     template_name = "workers/invite_worker.html"
@@ -292,46 +311,87 @@ class WorkerInviteView(CompanyAdminMixin, FormView):
         email = form.cleaned_data["email"]
         company = self.request.user.company
 
-        # Secure 32-character URL-safe token & 48-hour expiration
-        token = secrets.token_urlsafe(32)
+        # Clean 32-hex character token
+        token = uuid.uuid4().hex
         expires_at = timezone.now() + timedelta(hours=48)
 
-        invitation = Invitation.objects.create(
-            email=email,
-            company=company,
-            token=token,
-            expires_at=expires_at,
-        )
+        with transaction.atomic():
+            # Invalidate any older unaccepted invitation for this email
+            Invitation.objects.filter(company=company, email__iexact=email, is_accepted=False).delete()
 
-        # Dispatch onboarding invitation email
+            # Create fresh invitation
+            invitation = Invitation.objects.create(
+                email=email,
+                company=company,
+                token=token,
+                expires_at=expires_at,
+            )
+
+            # Pre-allot user account in DB with initial temporary password '12345'
+            worker_user = User.objects.filter(email__iexact=email).first()
+            if not worker_user:
+                worker_user = User.objects.create_user(
+                    email=email,
+                    password="12345",
+                    role=User.Roles.WORKER,
+                    company=company,
+                )
+            else:
+                worker_user.company = company
+                worker_user.role = User.Roles.WORKER
+                worker_user.set_password("12345")
+                worker_user.save()
+
+        # Build invite acceptance URL
         invite_url = self.request.build_absolute_uri(
             reverse("accept_invite", kwargs={"token": invitation.token})
         )
 
         email_subject = f"Invitation to join {company.name} on WorkHub"
-        email_body = (
+        inviter_name = self.request.user.get_full_name() or self.request.user.email
+
+        email_context = {
+            "company": company,
+            "inviter_name": inviter_name,
+            "email": email,
+            "invite_url": invite_url,
+        }
+
+        # Render rich HTML email template & plain text fallback
+        html_content = render_to_string("emails/worker_invitation.html", email_context)
+        plain_text_content = (
             f"Hello,\n\n"
-            f"You have been invited by {self.request.user.get_full_name() or self.request.user.email} "
-            f"to join the team at {company.name} on WorkHub.\n\n"
-            f"To accept this invitation, set up your credentials, and access your dashboard, "
-            f"please click the link below:\n\n"
+            f"You have been invited by {inviter_name} to join the team at {company.name} on WorkHub.\n\n"
+            f"Account Details:\n"
+            f"- Email: {email}\n"
+            f"- Temporary Password: 12345\n\n"
+            f"To complete your onboarding and choose your permanent password, click the link below:\n\n"
             f"{invite_url}\n\n"
-            f"Note: This invitation link is unique to you and will expire in 48 hours.\n\n"
+            f"This link expires in 48 hours.\n\n"
             f"Best regards,\nThe WorkHub Team"
         )
 
-        send_mail(
+        # Dispatch real multi-alternative email (HTML + Plain Text)
+        msg = EmailMultiAlternatives(
             subject=email_subject,
-            message=email_body,
+            body=plain_text_content,
             from_email=getattr(settings, "DEFAULT_FROM_EMAIL", "noreply@workhub.internal"),
-            recipient_list=[email],
-            fail_silently=False,
+            to=[email],
         )
+        msg.attach_alternative(html_content, "text/html")
 
-        messages.success(
-            self.request,
-            f"Invitation successfully dispatched to {email}. Link valid for 48 hours.",
-        )
+        try:
+            msg.send(fail_silently=False)
+            messages.success(
+                self.request,
+                f"Invitation successfully dispatched to {email}. An email with setup instructions and the temporary password (12345) has been sent to their inbox.",
+            )
+        except Exception as exc:
+            messages.error(
+                self.request,
+                f"Could not connect to Gmail SMTP: {exc}. Please verify your 16-character Google App Password in settings.py.",
+            )
+
         return HttpResponseRedirect(self.get_success_url())
 
 
